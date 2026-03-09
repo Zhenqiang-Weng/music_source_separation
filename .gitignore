@@ -1,0 +1,25 @@
+# 忽略模型文件
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# 忽略音频
+*.wav
+*.mp3
+*.flac
+
+# 忽略数据集
+data/
+dataset/
+
+# 忽略日志
+logs/
+*.log
+
+# python
+__pycache__/
+*.pyc
+
+# mac
+.DS_Store
