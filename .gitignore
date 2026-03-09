@@ -22,4 +22,5 @@ __pycache__/
 *.pyc
 
 # mac
-.DS_Store
+.DS_Store"ckpts/" 
+"*.ckpt" 
