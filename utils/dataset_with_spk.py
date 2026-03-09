@@ -1,0 +1,848 @@
+# coding: utf-8
+
+import os
+import random
+import numpy as np
+import torch
+import soundfile as sf
+import pickle
+import itertools
+import multiprocessing
+from tqdm.auto import tqdm
+from glob import glob
+import audiomentations as AU
+import pedalboard as PB
+import warnings
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+warnings.filterwarnings("ignore")
+from typing import Dict
+import argparse
+
+
+def prepare_data(config: Dict, args: argparse.Namespace, batch_size: int) -> DataLoader:
+    """
+    Build the training DataLoader. If torch.distributed.is_initialized() is True,
+    construct a DDP DataLoader (with DistributedSampler and dataset batch_size scaled
+    by world_size); otherwise, construct a regular single-process DataLoader.
+
+    Args:
+        config (Dict): Dataset/configuration dictionary passed to MSSDatasetWithSpk.
+        args (argparse.Namespace): Must provide `data_path`, `results_path`, `dataset_type`,
+            and DataLoader settings (`num_workers`, `pin_memory`, `persistent_workers`,
+            `prefetch_factor`).
+        batch_size (int): Per-process mini-batch size for the DataLoader.
+
+    Returns:
+        DataLoader: Configured DataLoader for the training split.
+    """
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        trainset = MSSDatasetWithSpk(
+            config,
+            args.data_path,
+            batch_size=batch_size * world_size,  # maintain "num_steps" semantics across the whole world
+            metadata_path=os.path.join(args.results_path, f"metadata_{args.dataset_type}.pkl"),
+            dataset_type=args.dataset_type,
+        )
+
+        sampler = DistributedSampler(
+            trainset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+        )
+
+        train_loader = DataLoader(
+            trainset,
+            batch_size=batch_size,             # per-process batch size
+            sampler=sampler,                   # sampler handles shuffling in DDP
+            num_workers=args.num_workers,
+            pin_memory=args.pin_memory,
+            persistent_workers=args.persistent_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
+    else:
+        trainset = MSSDatasetWithSpk(
+            config,
+            args.data_path,
+            batch_size=batch_size,
+            metadata_path=os.path.join(args.results_path, f"metadata_{args.dataset_type}.pkl"),
+            dataset_type=args.dataset_type,
+        )
+
+        train_loader = DataLoader(
+            trainset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_memory,
+            persistent_workers=args.persistent_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
+
+    return train_loader
+
+
+def load_chunk(path, length, chunk_size, offset=None):
+    if chunk_size <= length:
+        if offset is None:
+            offset = np.random.randint(length - chunk_size + 1)
+        x = sf.read(path, dtype='float32', start=offset, frames=chunk_size)[0]
+    else:
+        x = sf.read(path, dtype='float32')[0]
+        if len(x.shape) == 1:
+            # Mono case
+            pad = np.zeros((chunk_size - length))
+        else:
+            pad = np.zeros([chunk_size - length, x.shape[-1]])
+        x = np.concatenate([x, pad], axis=0)
+    # Mono fix
+    if len(x.shape) == 1:
+        x = np.expand_dims(x, axis=1)
+    return x.T
+
+
+def ensure_two_channels(source):
+    source = np.asarray(source)
+    if source.ndim == 1:
+        source = np.expand_dims(source, axis=0)
+    if source.shape[0] == 1:
+        source = np.repeat(source, 2, axis=0)
+    elif source.shape[0] > 2:
+        source = source[:2]
+    return source.astype(np.float32, copy=False)
+
+
+def get_track_set_length(params):
+    should_print = not dist.is_initialized() or dist.get_rank() == 0
+
+    path, instruments, file_types = params
+    # Check lengths of all instruments (it can be different in some cases)
+    lengths_arr = []
+    for instr in instruments:
+        length = -1
+        for extension in file_types:
+            path_to_audio_file = path + '/{}.{}'.format(instr, extension)
+            if os.path.isfile(path_to_audio_file):
+                length = sf.info(path_to_audio_file).frames
+                break
+        if length == -1 and should_print:
+            print('Cant find file "{}" in folder {}'.format(instr, path))
+            continue
+        lengths_arr.append(length)
+    lengths_arr = np.array(lengths_arr)
+    if lengths_arr.min() != lengths_arr.max() and should_print:
+        print('Warning: lengths of stems are different for path: {}. ({} != {})'.format(
+            path,
+            lengths_arr.min(),
+            lengths_arr.max())
+        )
+    # We use minimum to allow overflow for soundfile read in non-equal length cases
+    return path, lengths_arr.min()
+
+
+# For multiprocessing
+def get_track_length(params):
+    path = params
+    length = sf.info(path).frames
+    return (path, length)
+
+
+class MSSDatasetWithSpk(torch.utils.data.Dataset):
+    """
+    Changes vs original:
+    - Remove concept of mix_instruments; treat mix stems == training stems == `config.training.instruments`.
+    - Remove extra_sources / config.training.mix_instruments loading and mixing.
+    - Mixture is always sum of `res` (the stems in `self.instruments`).
+    - target_instrument logic kept (optionally train only one stem).
+    """
+    def __init__(self, config, data_path, metadata_path="metadata.pkl", dataset_type=1, batch_size=None, verbose=True):
+        self.verbose = verbose
+        self.config = config
+        self.dataset_type = dataset_type  # 1, 2, 3 or 4
+        self.data_path = data_path
+
+        self.instruments = list(config.training.instruments)
+        # no longer distinguish mix_instruments
+        self.mix_instruments = list(self.instruments)
+
+        if batch_size is None:
+            batch_size = config.training.batch_size
+        self.batch_size = batch_size
+
+        self.file_types = ['wav', 'flac']
+        self.metadata_path = metadata_path
+
+        should_print = (not dist.is_initialized() or dist.get_rank() == 0)
+
+        # Augmentation block
+        self.aug = False
+        if 'augmentations' in config:
+            if config['augmentations'].enable is True:
+                if self.verbose and should_print:
+                    print('Use augmentation for training')
+                self.aug = True
+        else:
+            if self.verbose and should_print:
+                print('There is no augmentations block in config. Augmentations disabled for training...')
+
+        metadata = self.get_metadata()
+
+        if self.dataset_type in [1, 4]:
+            if len(metadata) > 0:
+                if self.verbose and should_print:
+                    print('Found tracks in dataset: {}'.format(len(metadata)))
+            else:
+                if should_print:
+                    print('No tracks found for training. Check paths you provided!')
+                exit()
+        else:
+            for instr in self.instruments:
+                if self.verbose and should_print:
+                    print('Found tracks for {} in dataset: {}'.format(instr, len(metadata[instr])))
+
+        self.metadata = metadata
+        self.chunk_size = config.audio.chunk_size
+        self.min_mean_abs = config.audio.min_mean_abs
+
+        # optional safety check
+        ti = getattr(self.config.training, "target_instrument", None)
+        if ti is not None:
+            assert ti in self.instruments, f"target_instrument={ti} not in instruments={self.instruments}"
+
+    def __len__(self):
+        return self.config.training.num_steps * self.batch_size
+
+    def read_from_metadata_cache(self, track_paths, instr=None):
+        should_print = (not dist.is_initialized() or dist.get_rank() == 0)
+        metadata = []
+        if os.path.isfile(self.metadata_path):
+            if self.verbose and should_print:
+                print('Found metadata cache file: {}'.format(self.metadata_path))
+            old_metadata = pickle.load(open(self.metadata_path, 'rb'))
+        else:
+            return track_paths, metadata
+
+        if instr:
+            old_metadata = old_metadata[instr]
+
+        # We will not re-read tracks existed in old metadata file
+        track_paths_set = set(track_paths)
+        for old_path, file_size in old_metadata:
+            if old_path in track_paths_set:
+                metadata.append([old_path, file_size])
+                track_paths_set.remove(old_path)
+        track_paths = list(track_paths_set)
+        if len(metadata) > 0 and should_print:
+            print('Old metadata was used for {} tracks.'.format(len(metadata)))
+        return track_paths, metadata
+
+    def get_metadata(self):
+        read_metadata_procs = multiprocessing.cpu_count()
+        should_print = not dist.is_initialized() or dist.get_rank() == 0
+        if 'read_metadata_procs' in self.config['training']:
+            read_metadata_procs = int(self.config['training']['read_metadata_procs'])
+
+        if self.verbose and should_print:
+            print(
+                'Dataset type:', self.dataset_type,
+                'Processes to use:', read_metadata_procs,
+                '\nCollecting metadata for', str(self.data_path),
+            )
+
+        if self.dataset_type in [1, 4]:
+            track_paths = []
+            if type(self.data_path) == list:
+                for tp in self.data_path:
+                    tracks_for_folder = sorted(glob(tp + '/*'))
+                    if len(tracks_for_folder) == 0 and should_print:
+                        print('Warning: no tracks found in folder \'{}\'. Please check it!'.format(tp))
+                    track_paths += tracks_for_folder
+            else:
+                track_paths += sorted(glob(self.data_path + '/*'))
+
+            track_paths = [path for path in track_paths if os.path.basename(path)[0] != '.' and os.path.isdir(path)]
+            track_paths, metadata = self.read_from_metadata_cache(track_paths, None)
+
+            if read_metadata_procs <= 1:
+                pbar = tqdm(track_paths) if should_print else track_paths
+                for path in pbar:
+                    track_path, track_length = get_track_set_length((path, self.instruments, self.file_types))
+                    metadata.append((track_path, track_length))
+            else:
+                p = multiprocessing.Pool(processes=read_metadata_procs)
+                if should_print:
+                    with tqdm(total=len(track_paths)) as pbar:
+                        track_iter = p.imap(
+                            get_track_set_length,
+                            zip(track_paths, itertools.repeat(self.instruments), itertools.repeat(self.file_types))
+                        )
+                        for track_path, track_length in track_iter:
+                            metadata.append((track_path, track_length))
+                            pbar.update()
+                p.close()
+
+        elif self.dataset_type == 2:
+            # IMPORTANT: use instruments (no mix_instruments concept)
+            metadata = dict()
+            for instr in self.instruments:
+                metadata[instr] = []
+                track_paths = []
+                if type(self.data_path) == list:
+                    for tp in self.data_path:
+                        track_paths += sorted(glob(tp + '/{}/*.wav'.format(instr)))
+                        track_paths += sorted(glob(tp + '/{}/*.flac'.format(instr)))
+                else:
+                    track_paths += sorted(glob(self.data_path + '/{}/*.wav'.format(instr)))
+                    track_paths += sorted(glob(self.data_path + '/{}/*.flac'.format(instr)))
+
+                track_paths, metadata[instr] = self.read_from_metadata_cache(track_paths, instr)
+
+                if read_metadata_procs <= 1:
+                    pbar = tqdm(track_paths) if should_print else track_paths
+                    for path in pbar:
+                        length = sf.info(path).frames
+                        metadata[instr].append((path, length))
+                else:
+                    p = multiprocessing.Pool(processes=read_metadata_procs)
+                    track_iter = p.imap(get_track_length, track_paths)
+                    if should_print:
+                        track_iter = tqdm(track_iter, total=len(track_paths))
+
+                    for out in track_iter:
+                        metadata[instr].append(out)
+                    p.close()
+
+        elif self.dataset_type == 3:
+            import pandas as pd
+            if type(self.data_path) != list:
+                data_path = [self.data_path]
+            else:
+                data_path = self.data_path
+
+            metadata = dict()
+            for i in range(len(data_path)):
+                if self.verbose and should_print:
+                    print('Reading tracks from: {}'.format(data_path[i]))
+                df = pd.read_csv(data_path[i])
+
+                skipped = 0
+                for instr in self.instruments:
+                    part = df[df['instrum'] == instr].copy()
+                    if should_print:
+                        print('Tracks found for {}: {}'.format(instr, len(part)))
+
+                for instr in self.instruments:
+                    part = df[df['instrum'] == instr].copy()
+                    metadata[instr] = []
+                    track_paths = list(part['path'].values)
+                    track_paths, metadata[instr] = self.read_from_metadata_cache(track_paths, instr)
+
+                    pbar = tqdm(track_paths) if should_print else track_paths
+                    for path in pbar:
+                        if not os.path.isfile(path):
+                            if should_print:
+                                print('Cant find track: {}'.format(path))
+                            skipped += 1
+                            continue
+                        try:
+                            length = sf.info(path).frames
+                        except Exception:
+                            if should_print:
+                                print('Problem with path: {}'.format(path))
+                            skipped += 1
+                            continue
+                        metadata[instr].append((path, length))
+
+                if skipped > 0 and should_print:
+                    print('Missing tracks: {} from {}'.format(skipped, len(df)))
+        else:
+            if should_print:
+                print('Unknown dataset type: {}. Must be 1, 2, 3 or 4'.format(self.dataset_type))
+            exit()
+
+        # Save metadata
+        pickle.dump(metadata, open(self.metadata_path, 'wb'))
+        return metadata
+
+    def load_source(self, metadata, instr):
+        should_print = (not dist.is_initialized() or dist.get_rank() == 0)
+        while True:
+            if self.dataset_type in [1, 4]:
+                track_path, track_length = random.choice(metadata)
+                for extension in self.file_types:
+                    path_to_audio_file = track_path + '/{}.{}'.format(instr, extension)
+                    if os.path.isfile(path_to_audio_file):
+                        try:
+                            source = load_chunk(path_to_audio_file, track_length, self.chunk_size)
+                            source = ensure_two_channels(source)
+                        except Exception as e:
+                            if should_print:
+                                print('Error: {} Path: {}'.format(e, path_to_audio_file))
+                            source = np.zeros((2, self.chunk_size), dtype=np.float32)
+                        break
+            else:
+                track_path, track_length = random.choice(metadata[instr])
+                try:
+                    source = load_chunk(track_path, track_length, self.chunk_size)
+                    source = ensure_two_channels(source)
+                except Exception as e:
+                    if should_print:
+                        print('Error: {} Path: {}'.format(e, track_path))
+                    source = np.zeros((2, self.chunk_size), dtype=np.float32)
+
+            if np.abs(source).mean() >= self.min_mean_abs:  # remove quiet chunks
+                break
+
+        if self.aug:
+            source = self.augm_data(source, instr)
+        source = ensure_two_channels(source)
+        return torch.tensor(source, dtype=torch.float32), track_path
+
+    def load_random_mix(self):
+        """
+        Return:
+            res: Tensor (num_instruments, 2, chunk_size)
+            extra_sources: always []
+            embedding: None (will be converted to zeros later)
+        """
+        res = []
+        for instr in self.instruments:
+            s1, _ = self.load_source(self.metadata, instr)
+
+            # Mixup augmentation: multiple mix of same type of stems
+            if self.aug and 'mixup' in self.config['augmentations'] and self.config['augmentations'].mixup:
+                mixup = [s1]
+                for prob in self.config.augmentations.mixup_probs:
+                    if random.uniform(0, 1) < prob:
+                        s2, _ = self.load_source(self.metadata, instr)
+                        mixup.append(s2)
+                mixup = torch.stack(mixup, dim=0)
+                loud_values = np.random.uniform(
+                    low=self.config.augmentations.loudness_min,
+                    high=self.config.augmentations.loudness_max,
+                    size=(len(mixup),)
+                )
+                loud_values = torch.tensor(loud_values, dtype=torch.float32)
+                mixup *= loud_values[:, None, None]
+                s1 = mixup.mean(dim=0, dtype=torch.float32)
+
+            res.append(s1)
+
+        res = torch.stack(res)
+        return res, [], None
+
+    def load_aligned_data(self):
+        """
+        dataset_type==4 path-level aligned loading.
+        Keeps embedding.npy loading logic.
+        """
+        track_path, track_length = random.choice(self.metadata)
+        should_print = (not dist.is_initialized() or dist.get_rank() == 0)
+        attempts = 10
+
+        while attempts:
+            if track_length >= self.chunk_size:
+                common_offset = np.random.randint(track_length - self.chunk_size + 1)
+            else:
+                common_offset = None
+
+            res = []
+            silent_chunks = 0
+            for i in self.instruments:
+                source = None
+                for extension in self.file_types:
+                    path_to_audio_file = track_path + '/{}.{}'.format(i, extension)
+                    if os.path.isfile(path_to_audio_file):
+                        try:
+                            source = load_chunk(path_to_audio_file, track_length, self.chunk_size, offset=common_offset)
+                            source = ensure_two_channels(source)
+                        except Exception as e:
+                            if should_print:
+                                print('Error: {} Path: {}'.format(e, path_to_audio_file))
+                            source = np.zeros((2, self.chunk_size), dtype=np.float32)
+                        break
+                if source is None:
+                    source = np.zeros((2, self.chunk_size), dtype=np.float32)
+
+                res.append(ensure_two_channels(source))
+                if np.abs(source).mean() < self.min_mean_abs:
+                    silent_chunks += 1
+
+            if silent_chunks == 0:
+                break
+
+            attempts -= 1
+            if attempts <= 0 and should_print:
+                print('Attempts max!', track_path)
+            if common_offset is None:
+                break
+
+        try:
+            res = np.stack(res, axis=0)
+        except Exception as e:
+            print('Error during stacking stems: {} Track Length: {} Track path: {}'.format(
+                str(e), track_length, track_path))
+            res = np.zeros((len(self.instruments), 2, self.chunk_size), dtype=np.float32)
+
+        if self.aug:
+            for i, instr in enumerate(self.instruments):
+                res[i] = ensure_two_channels(self.augm_data(res[i], instr))
+
+        # Load embeddings
+        embedding = None
+        embedding_path = os.path.join(track_path, 'embeddings.npy')
+        if os.path.exists(embedding_path):
+            try:
+                embeddings = np.load(embedding_path)
+                if embeddings.shape[0] > 0:
+                    num_samples = min(20, embeddings.shape[0])
+                    indices = np.random.choice(embeddings.shape[0], num_samples, replace=False)
+                    selected_embeddings = embeddings[indices]
+                    embedding = np.mean(selected_embeddings, axis=0)  # (192,)
+                    embedding = torch.from_numpy(embedding).float()
+            except Exception as e:
+                if should_print:
+                    print(f'Error loading embeddings from {embedding_path}: {e}')
+
+        return torch.tensor(res, dtype=torch.float32), [], embedding
+
+    def augm_data(self, source, instr):
+        # source.shape = (2, L)
+        source_shape = source.shape
+        applied_augs = []
+
+        if 'all' in self.config['augmentations']:
+            augs = self.config['augmentations']['all']
+        else:
+            augs = dict()
+
+        # Stem-specific overrides
+        if instr in self.config['augmentations']:
+            for el in self.config['augmentations'][instr]:
+                augs[el] = self.config['augmentations'][instr][el]
+
+        # Channel shuffle
+        if 'channel_shuffle' in augs and augs['channel_shuffle'] > 0:
+            if random.uniform(0, 1) < augs['channel_shuffle']:
+                source = source[::-1].copy()
+                applied_augs.append('channel_shuffle')
+
+        # Random inverse
+        if 'random_inverse' in augs and augs['random_inverse'] > 0:
+            if random.uniform(0, 1) < augs['random_inverse']:
+                source = source[:, ::-1].copy()
+                applied_augs.append('random_inverse')
+
+        # Random polarity
+        if 'random_polarity' in augs and augs['random_polarity'] > 0:
+            if random.uniform(0, 1) < augs['random_polarity']:
+                source = -source.copy()
+                applied_augs.append('random_polarity')
+
+        # Random pitch shift (audiomentations)
+        if 'pitch_shift' in augs and augs['pitch_shift'] > 0:
+            if random.uniform(0, 1) < augs['pitch_shift']:
+                apply_aug = AU.PitchShift(
+                    min_semitones=augs['pitch_shift_min_semitones'],
+                    max_semitones=augs['pitch_shift_max_semitones'],
+                    p=1.0
+                )
+                source = apply_aug(samples=source, sample_rate=44100)
+                applied_augs.append('pitch_shift')
+
+        # Seven band EQ
+        if 'seven_band_parametric_eq' in augs and augs['seven_band_parametric_eq'] > 0:
+            if random.uniform(0, 1) < augs['seven_band_parametric_eq']:
+                apply_aug = AU.SevenBandParametricEQ(
+                    min_gain_db=augs['seven_band_parametric_eq_min_gain_db'],
+                    max_gain_db=augs['seven_band_parametric_eq_max_gain_db'],
+                    p=1.0
+                )
+                source = apply_aug(samples=source, sample_rate=44100)
+                applied_augs.append('seven_band_parametric_eq')
+
+        # tanh distortion
+        if 'tanh_distortion' in augs and augs['tanh_distortion'] > 0:
+            if random.uniform(0, 1) < augs['tanh_distortion']:
+                apply_aug = AU.TanhDistortion(
+                    min_distortion=augs['tanh_distortion_min'],
+                    max_distortion=augs['tanh_distortion_max'],
+                    p=1.0
+                )
+                source = apply_aug(samples=source, sample_rate=44100)
+                applied_augs.append('tanh_distortion')
+
+        # mp3 compression
+        if 'mp3_compression' in augs and augs['mp3_compression'] > 0:
+            if random.uniform(0, 1) < augs['mp3_compression']:
+                apply_aug = AU.Mp3Compression(
+                    min_bitrate=augs['mp3_compression_min_bitrate'],
+                    max_bitrate=augs['mp3_compression_max_bitrate'],
+                    backend=augs['mp3_compression_backend'],
+                    p=1.0
+                )
+                source = apply_aug(samples=source, sample_rate=44100)
+                applied_augs.append('mp3_compression')
+
+        # gaussian noise
+        if 'gaussian_noise' in augs and augs['gaussian_noise'] > 0:
+            if random.uniform(0, 1) < augs['gaussian_noise']:
+                apply_aug = AU.AddGaussianNoise(
+                    min_amplitude=augs['gaussian_noise_min_amplitude'],
+                    max_amplitude=augs['gaussian_noise_max_amplitude'],
+                    p=1.0
+                )
+                source = apply_aug(samples=source, sample_rate=44100)
+                applied_augs.append('gaussian_noise')
+
+        # time stretch
+        if 'time_stretch' in augs and augs['time_stretch'] > 0:
+            if random.uniform(0, 1) < augs['time_stretch']:
+                apply_aug = AU.TimeStretch(
+                    min_rate=augs['time_stretch_min_rate'],
+                    max_rate=augs['time_stretch_max_rate'],
+                    leave_length_unchanged=True,
+                    p=1.0
+                )
+                source = apply_aug(samples=source, sample_rate=44100)
+                applied_augs.append('time_stretch')
+
+        # Possible fix of shape
+        if source_shape != source.shape:
+            source = source[..., :source_shape[-1]]
+
+        # --- pedalboard effects (kept as-is) ---
+        # Random Reverb
+        if 'pedalboard_reverb' in augs and augs['pedalboard_reverb'] > 0:
+            if random.uniform(0, 1) < augs['pedalboard_reverb']:
+                room_size = random.uniform(
+                    augs['pedalboard_reverb_room_size_min'],
+                    augs['pedalboard_reverb_room_size_max'],
+                )
+                damping = random.uniform(
+                    augs['pedalboard_reverb_damping_min'],
+                    augs['pedalboard_reverb_damping_max'],
+                )
+                wet_level = random.uniform(
+                    augs['pedalboard_reverb_wet_level_min'],
+                    augs['pedalboard_reverb_wet_level_max'],
+                )
+                dry_level = random.uniform(
+                    augs['pedalboard_reverb_dry_level_min'],
+                    augs['pedalboard_reverb_dry_level_max'],
+                )
+                width = random.uniform(
+                    augs['pedalboard_reverb_width_min'],
+                    augs['pedalboard_reverb_width_max'],
+                )
+                board = PB.Pedalboard([PB.Reverb(
+                    room_size=room_size,
+                    damping=damping,
+                    wet_level=wet_level,
+                    dry_level=dry_level,
+                    width=width,
+                    freeze_mode=0.0,
+                )])
+                source = board(source, 44100)
+                applied_augs.append('pedalboard_reverb')
+
+        # Random Chorus
+        if 'pedalboard_chorus' in augs and augs['pedalboard_chorus'] > 0:
+            if random.uniform(0, 1) < augs['pedalboard_chorus']:
+                rate_hz = random.uniform(
+                    augs['pedalboard_chorus_rate_hz_min'],
+                    augs['pedalboard_chorus_rate_hz_max'],
+                )
+                depth = random.uniform(
+                    augs['pedalboard_chorus_depth_min'],
+                    augs['pedalboard_chorus_depth_max'],
+                )
+                centre_delay_ms = random.uniform(
+                    augs['pedalboard_chorus_centre_delay_ms_min'],
+                    augs['pedalboard_chorus_centre_delay_ms_max'],
+                )
+                feedback = random.uniform(
+                    augs['pedalboard_chorus_feedback_min'],
+                    augs['pedalboard_chorus_feedback_max'],
+                )
+                mix = random.uniform(
+                    augs['pedalboard_chorus_mix_min'],
+                    augs['pedalboard_chorus_mix_max'],
+                )
+                board = PB.Pedalboard([PB.Chorus(
+                    rate_hz=rate_hz,
+                    depth=depth,
+                    centre_delay_ms=centre_delay_ms,
+                    feedback=feedback,
+                    mix=mix,
+                )])
+                source = board(source, 44100)
+                applied_augs.append('pedalboard_chorus')
+
+        # Random Phaser
+        if 'pedalboard_phazer' in augs and augs['pedalboard_phazer'] > 0:
+            if random.uniform(0, 1) < augs['pedalboard_phazer']:
+                rate_hz = random.uniform(
+                    augs['pedalboard_phazer_rate_hz_min'],
+                    augs['pedalboard_phazer_rate_hz_max'],
+                )
+                depth = random.uniform(
+                    augs['pedalboard_phazer_depth_min'],
+                    augs['pedalboard_phazer_depth_max'],
+                )
+                centre_frequency_hz = random.uniform(
+                    augs['pedalboard_phazer_centre_frequency_hz_min'],
+                    augs['pedalboard_phazer_centre_frequency_hz_max'],
+                )
+                feedback = random.uniform(
+                    augs['pedalboard_phazer_feedback_min'],
+                    augs['pedalboard_phazer_feedback_max'],
+                )
+                mix = random.uniform(
+                    augs['pedalboard_phazer_mix_min'],
+                    augs['pedalboard_phazer_mix_max'],
+                )
+                board = PB.Pedalboard([PB.Phaser(
+                    rate_hz=rate_hz,
+                    depth=depth,
+                    centre_frequency_hz=centre_frequency_hz,
+                    feedback=feedback,
+                    mix=mix,
+                )])
+                source = board(source, 44100)
+                applied_augs.append('pedalboard_phazer')
+
+        # Random Distortion
+        if 'pedalboard_distortion' in augs and augs['pedalboard_distortion'] > 0:
+            if random.uniform(0, 1) < augs['pedalboard_distortion']:
+                drive_db = random.uniform(
+                    augs['pedalboard_distortion_drive_db_min'],
+                    augs['pedalboard_distortion_drive_db_max'],
+                )
+                board = PB.Pedalboard([PB.Distortion(
+                    drive_db=drive_db,
+                )])
+                source = board(source, 44100)
+                applied_augs.append('pedalboard_distortion')
+
+        # Random PitchShift
+        if 'pedalboard_pitch_shift' in augs and augs['pedalboard_pitch_shift'] > 0:
+            if random.uniform(0, 1) < augs['pedalboard_pitch_shift']:
+                semitones = random.uniform(
+                    augs['pedalboard_pitch_shift_semitones_min'],
+                    augs['pedalboard_pitch_shift_semitones_max'],
+                )
+                board = PB.Pedalboard([PB.PitchShift(
+                    semitones=semitones
+                )])
+                source = board(source, 44100)
+                applied_augs.append('pedalboard_pitch_shift')
+
+        # Random Resample
+        if 'pedalboard_resample' in augs and augs['pedalboard_resample'] > 0:
+            if random.uniform(0, 1) < augs['pedalboard_resample']:
+                target_sample_rate = random.uniform(
+                    augs['pedalboard_resample_target_sample_rate_min'],
+                    augs['pedalboard_resample_target_sample_rate_max'],
+                )
+                board = PB.Pedalboard([PB.Resample(
+                    target_sample_rate=target_sample_rate
+                )])
+                source = board(source, 44100)
+                applied_augs.append('pedalboard_resample')
+
+        # Random Bitcrush
+        if 'pedalboard_bitcrash' in augs and augs['pedalboard_bitcrash'] > 0:
+            if random.uniform(0, 1) < augs['pedalboard_bitcrash']:
+                bit_depth = random.uniform(
+                    augs['pedalboard_bitcrash_bit_depth_min'],
+                    augs['pedalboard_bitcrash_bit_depth_max'],
+                )
+                board = PB.Pedalboard([PB.Bitcrush(
+                    bit_depth=bit_depth
+                )])
+                source = board(source, 44100)
+                applied_augs.append('pedalboard_bitcrash')
+
+        # Random MP3Compressor
+        if 'pedalboard_mp3_compressor' in augs and augs['pedalboard_mp3_compressor'] > 0:
+            if random.uniform(0, 1) < augs['pedalboard_mp3_compressor']:
+                vbr_quality = random.uniform(
+                    augs['pedalboard_mp3_compressor_pedalboard_mp3_compressor_min'],
+                    augs['pedalboard_mp3_compressor_pedalboard_mp3_compressor_max'],
+                )
+                board = PB.Pedalboard([PB.MP3Compressor(
+                    vbr_quality=vbr_quality
+                )])
+                source = board(source, 44100)
+                applied_augs.append('pedalboard_mp3_compressor')
+
+        return source
+
+    def __getitem__(self, index):
+        if self.dataset_type in [1, 2, 3]:
+            res, _, embedding = self.load_random_mix()
+        else:
+            res, _, embedding = self.load_aligned_data()
+
+        # ---- mixing uses ONLY instruments stems ----
+        all_sources = res  # (num_instr, 2, chunk)
+
+        if self.aug and 'random_drop_stems' in self.config['augmentations']:
+            drop_prob = self.config['augmentations']['random_drop_stems_prob']
+            drop_set = set(self.config['augmentations']['random_drop_stems_instruments'])
+            for i, instrument in enumerate(self.instruments):
+                if instrument in drop_set and random.uniform(0, 1) < drop_prob:
+                    all_sources[i] = torch.zeros_like(all_sources[i])
+
+        # Randomly change loudness of each stem
+        if self.aug and 'loudness' in self.config['augmentations'] and self.config['augmentations']['loudness']:
+            loud_values = np.random.uniform(
+                low=self.config['augmentations']['loudness_min'],
+                high=self.config['augmentations']['loudness_max'],
+                size=(len(all_sources),)
+            )
+            loud_values = torch.tensor(loud_values, dtype=torch.float32)
+            all_sources *= loud_values[:, None, None]
+
+        res = all_sources
+        mix = all_sources.sum(0)
+
+        # Mixture mp3 compression (kept)
+        if self.aug and 'mp3_compression_on_mixture' in self.config['augmentations']:
+            apply_aug = AU.Mp3Compression(
+                min_bitrate=self.config['augmentations']['mp3_compression_on_mixture_bitrate_min'],
+                max_bitrate=self.config['augmentations']['mp3_compression_on_mixture_bitrate_max'],
+                backend=self.config['augmentations']['mp3_compression_on_mixture_backend'],
+                p=self.config['augmentations']['mp3_compression_on_mixture']
+            )
+            mix_conv = mix.cpu().numpy().astype(np.float32)
+            required_shape = mix_conv.shape
+            mix2 = apply_aug(samples=mix_conv, sample_rate=44100)
+            if mix2.shape != required_shape:
+                mix2 = mix2[..., :required_shape[-1]]
+            mix = torch.tensor(mix2, dtype=torch.float32)
+
+        if self.aug and 'disharmony' in self.config['augmentations']:
+            if self.config['augmentations']['disharmony']:
+                pass
+
+        # embeddings: keep output shape stable
+        if embedding is None:
+            embedding = torch.zeros((192,), dtype=torch.float32)
+            # avoid spamming logs in multiworker; print only on main rank
+            if (not dist.is_initialized()) or dist.get_rank() == 0:
+                print('Warning: No embedding found, returning zeros.')
+
+        # If we need to optimize only given stem
+        ti = getattr(self.config.training, "target_instrument", None)
+        if ti is not None:
+            idx = self.instruments.index(ti)
+            return res[idx:idx + 1], mix, embedding
+
+        return res, mix, embedding

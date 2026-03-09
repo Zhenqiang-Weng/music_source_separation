@@ -1,0 +1,51 @@
+# 快速创建窗口
+tmux new-window -t mss2 -n train3
+
+# 断开 tmux 会话
+Ctrl + b  然后按  d
+
+# 查看所有会话
+tmux ls
+
+# 重新连接会话
+tmux attach -t mss2
+tmux attach -t 0
+
+# 快速命令速记
+# 创建新窗口并命名为 train
+tmux new-window -t mss2 -n train
+tmux new-window -t mss1 -n train2
+
+# 在窗口中切换 (Ctrl + b + 数字或窗口名)
+Ctrl + b + n    # 下一个窗口
+Ctrl + b + p    # 上一个窗口
+Ctrl + b + 0-9  # 切换到指定窗口
+
+# 关闭会话
+tmux kill-session -t mss1
+
+
+git add .
+git commit -m "update"
+git push origin dev
+
+
+tmux attach -t mss1/mss2
+
+tmux attach -t mss1/train3
+
+tmux new-window -t mss2 
+
+tmux attach -t mss2
+
+
+tmux new-session -s mss2 -d
+tmux new-window -t mss2: -n train
+
+tmux new-session -s mss2 -n train
+
+
+cd /ailab-train/speech/wengzhenqiang/Music-Source-Separation-Training
+cd /user-fs/chenzihao/wengzhenqiang/seedvc
+source /ailab-train/speech/wengzhenqiang/minicodna3/bin/activate /ailab-train/speech/wengzhenqiang/envs/mss
+source /user-fs/chenzihao/wengzhenqiang/miniconda3/bin/activate /user-fs/chenzihao/wengzhenqiang/miniconda3/envs/svc

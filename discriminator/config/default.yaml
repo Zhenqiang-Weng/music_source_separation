@@ -1,0 +1,162 @@
+name: 'BASE-CC'
+desc: 'training cc base model on given dataset'
+
+data:
+  etl_path: '../training/czh/data_etl/'
+  # List Files
+  training_files: 'train.list'
+  validation_files: 'valid.list'
+  testing_files: 'test.list'
+  symbols_list: 'dict.list'
+  wave_files: 'wav.list'
+  statistic_file: 'stats.json'
+
+  # Data Loader
+  load_data_from_disk: true # if load spec from disk or not
+  compute_statistics: false
+  keywords: ['texts', 'brks', 'lens', 'specs', 'drns', 'f0s', 'nrgs', 'spks', 'stls']
+  batch_size: 32
+
+text:
+  symbols: []
+  specials: ['<pad>', '<unk>']
+  punctuations: [] # [',','.','!','?']
+
+audio:
+  filter_length: 2048 # 1024
+  hop_length: 300 # 256
+  win_length: 1200
+  window: 'hann'
+  power: 1.0
+  n_mel_channels: &nm 80
+  sampling_rate: 24000
+  bit_depth: 16 # bit depth (16,24, ...)
+  mel_fmin: 0.0
+  mel_fmax: 12000.0
+  f0_min: &fl 65.0
+  f0_max: &fh 1300.0
+  # Others
+  force_frame_rate: true # not used,force math sr by resample
+  preprocess:
+    match_volume: false
+    trim_silence: false # WARNING: false only !!!
+  reduction_rate: 1 # only support 1 now
+  normalization: 'standard' # 'none', 'standard', 'min-max'
+  feature_level: &flv 'phoneme'
+
+model:
+  out_channels: *nm # equal to ${audio.n_mel_channels}
+  n_symbols: -1
+  channels: &ch 384
+  enc_kernel_size: 4
+  dec_kernel_size: 4
+  enc_dilations: !!python/object/apply:eval ['4 * [1,2,4]    + [1]'] # receptive field is max 5
+  dec_dilations: !!python/object/applt:eval ['6 * [1,2,4,8]  + [1]'] # receptive field is max 17
+  normalization: 'layer' # 'freq', 'layer', 'batch'
+  dropout: 0.2
+  activation: 'relu' # 'relu', 'linear', 'sigmoid'
+  final_activation: 'linear'
+  enable_ssim_loss: true
+  ssim_window_size: [5] # [5,11]
+  # word encoder
+  conv_filter_size: 768
+  encoder_head: 2
+  encoder_layer: 4
+  conv_kernel_size: 5
+  encoder_window_size: 4
+  max_seq_len: 2000
+
+  # Duration
+  use_gaussian_upsample: false
+  pos_mode: 'duration' # 'standard', 'duration'
+  interpolate: true # true or false
+  duration_quantization: 'log' # 'linear', 'log'
+  enable_speed_moe: true
+  speed_boundaries: [0,4,7,150]
+  separate_duration_grad: true
+  duration_loss_lambda: 1.0
+  enable_cosine_loss: true
+  min_frames_per_phoneme: 2
+  max_frames_per_phoneme: 25
+  # Multi-voices
+  multi_speakers: true
+  n_speakers: 12
+  speaker_embedding_dim: *ch # speaker embedding dim
+  multi_styles: false
+  n_styles: 5
+  style_embedding_dim: *ch # style embedding dim
+  # Features
+  enable_break: true
+  n_breaks: 7
+  break_dim: *ch
+  features_loss_lambda: 1.0
+  feature_level: *flv
+  enable_pitch: true
+  # pitch_quantization: 'log'
+  pitch_bins: 512
+  pitch_range: [35, 88]
+  pitch_dim: *ch
+  enable_energy: true
+  # energy_quantization: 'log'
+  energy_bins: 512
+  energy_range: [-10,10]
+  energy_dim: *ch
+
+optim:
+  # LR and Schedule
+  lr: 0.0005
+  betas: [0.9,0.98]
+  eps: 0.000000001 # 1e-9
+  weight_decay: 0.0
+  factor: 0.5
+  patience: 1
+  grad_clip_thresh: 1.0
+  grad_acc_step: 1
+
+train:
+  epochs: 10
+  epochs_per_chkpt: 1
+  step_interval: 100
+  target_and_step: 500
+  checkpoint: null # none
+  seed: 12369
+  cudnn_enabled: true
+  cudnn_benchmark: false
+  logdir: 'logdir'
+  disable_progress_bar: false
+  out_path: '../training/czh/model/cc/'
+
+infer:
+  spec_path: '../training/czh/output/mel/'
+  chkpt_path: null # none
+  batch_size: 4
+
+discriminator:
+  n_train_start: 2000
+  gan_loss_lambda: 0.1
+  enable_hdn_loss: true # feature mapping loss
+  # Disc model
+  time_lengths: [64,64,64]
+  freq_lengths: [40,40,40]
+  kernel_size: 3
+  hidden_size: 128
+  # LR and Schedule
+  lr: 0.001
+  betas: [0.9,0.98]
+  eps: 0.000000001 # 1e-9
+  weight_decay: 0.0
+  n_warmup: 4000
+  init_scale: 0.25
+  grad_clip_thresh: 1.0
+  grad_acc_step: 1
+
+
+
+
+
+
+
+
+
+
+
