@@ -258,9 +258,9 @@ def train_model(args):
     if accelerator.is_main_process:
         if args.wandb_key is not None and args.wandb_key.strip() != '':
             wandb.login(key=args.wandb_key)
-            wandb.init(entity="mss-juren", project=args.wandb_project, name=args.wandb_name, config={'config': config, 'args': args, 'device_ids': device_ids, 'batch_size': batch_size})
+            wandb.init(project=args.wandb_project, name=args.wandb_name, config={'config': config, 'args': args, 'device_ids': device_ids, 'batch_size': batch_size})
         else:
-            wandb.init(entity="mss-juren", project=args.wandb_project, name=args.wandb_name, mode='offline', config={'config': config, 'args': args, 'device_ids': device_ids, 'batch_size': batch_size})
+            wandb.init(project=args.wandb_project, name=args.wandb_name, mode='offline', config={'config': config, 'args': args, 'device_ids': device_ids, 'batch_size': batch_size})
     else:
         wandb.init(mode='disabled')
 
