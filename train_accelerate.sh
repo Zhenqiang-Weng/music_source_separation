@@ -4,7 +4,7 @@ trap 'echo "Ctrl+C 清理进程中..."; pkill -f train_accelerate_fixed.py; exit
 
 # 如果需要在线同步，请填写 WANDB_KEY 并移除/注释 WANDB_MODE 设置
 # export WANDB_MODE="offline"
-WANDB_KEY="456ec973dc00b6906905122761925c11a860e679"
+WANDB_KEY=""
 
 export NCCL_DEBUG=INFO
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
