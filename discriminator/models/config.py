@@ -20,7 +20,7 @@ def _default_mr_stft_cfg() -> List[Dict[str, int]]:
 
 @dataclass
 class DiscriminatorConfig:
-    """Discriminator配置类（精简版）"""
+    """Discriminator configuration (compact version)."""
 
     input_type: str = "mel"
 

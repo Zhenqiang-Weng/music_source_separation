@@ -1,20 +1,20 @@
 """
-Discriminator包装类 - 支持Accelerate并行训练
-基于CC-Word-Encoder项目的discriminator实现
+Discriminator wrapper with Accelerate parallel training support.
+Implementation adapted from the CC-Word-Encoder discriminator design.
 
-使用示例:
+Usage example:
     from discriminator_wrapper import DiscriminatorWrapper
-    
-    # 初始化
+
+    # Initialize
     d_wrapper = DiscriminatorWrapper(
         config=d_config,
-        accelerator=accelerator  # 从accelerate导入的accelerator对象
+        accelerator=accelerator  # Accelerator object from accelerate
     )
-    
-    # 训练步骤
+
+    # One training step
     losses = d_wrapper.train_step(fake_data, real_data, lengths, current_step)
-    
-    # 保存checkpoint
+
+    # Save checkpoint
     d_wrapper.save_checkpoint("path/to/checkpoint.pth")
 """
 
@@ -37,10 +37,10 @@ except ImportError:
 
 class DiscriminatorWrapper:
     """
-    Discriminator训练包装类
-    
-    封装了discriminator的初始化、训练、保存等功能，
-    并支持accelerate并行训练
+    Discriminator training wrapper.
+
+    Encapsulates discriminator initialization, training, checkpoint save/load,
+    and supports accelerate-based parallel training.
     """
     
     def __init__(
@@ -50,25 +50,25 @@ class DiscriminatorWrapper:
         device: Optional[torch.device] = None
     ):
         """
-        初始化Discriminator包装类
-        
+        Initialize the Discriminator wrapper.
+
         Args:
-            config: 配置对象或字典
-            accelerator: accelerate的Accelerator对象，用于并行训练
-            device: 设备，如果提供accelerator则忽略此参数
+            config: Config object or config dict.
+            accelerator: Accelerator object used for parallel training.
+            device: Target device. Ignored when accelerator is provided.
         """
-        # 配置处理
+        # Parse config
         self.config = DiscriminatorConfig.from_dict(config) if isinstance(config, dict) else config
             
         self.accelerator = accelerator
         self.device = device if accelerator is None else None
         
-        # 初始化组件
+        # Initialize components
         self._init_discriminator()
         self._init_optimizer()
         self._init_criterion()
         
-        # 如果使用accelerate，准备模型和优化器
+        # Prepare model and optimizer when using accelerate
         if self.accelerator is not None:
             self.discriminator, self.optimizer, self.scheduler = \
                 self.accelerator.prepare(self.discriminator, self.optimizer, self.scheduler)
@@ -76,10 +76,10 @@ class DiscriminatorWrapper:
             self.discriminator = self.discriminator.to(self.device)
             
     def _init_discriminator(self):
-        """初始化discriminator模型"""
+        """Initialize discriminator model."""
         if getattr(self.config, 'input_type', 'mel') == 'mel':
             try:
-                # 尝试多个可能的导入路径
+                # Try several possible import paths
                 try:
                     from discriminator.models.discriminator import Discriminator
                 except ImportError:
@@ -90,33 +90,33 @@ class DiscriminatorWrapper:
                         sys.path.insert(0, current_dir)
                         from models.discriminator import Discriminator
             except ImportError:
-                raise ImportError("无法导入Discriminator类，请确保models.discriminator模块存在")
+                raise ImportError("Failed to import Discriminator. Ensure models.discriminator exists.")
             self.discriminator = Discriminator(self.config.get_mel_hparams())
         elif self.config.input_type == 'music':
-            # 使用增强型MusicDiscriminator（MSD+MPD+可选SpecD，hinge损失）
+            # Enhanced MusicDiscriminator (MSD+MPD+optional SpecD, hinge/rank losses)
             try:
                 try:
                     from discriminator.models.music_discriminator import MusicDiscriminator
                 except Exception:
                     from models.music_discriminator import MusicDiscriminator
             except Exception as e:
-                raise ImportError(f"无法导入MusicDiscriminator：{e}")
+                raise ImportError(f"Failed to import MusicDiscriminator: {e}")
             self.discriminator = MusicDiscriminator(**self.config.get_music_kwargs())
         else:
-            # 使用HiFi-GAN风格的多尺度多周期判别器（波形域）
+            # HiFi-GAN style multi-scale + multi-period discriminator (waveform domain)
             try:
                 try:
                     from discriminator.models.hifigan import HiFiGANDiscriminator
                 except Exception:
                     from models.hifigan import HiFiGANDiscriminator
             except Exception as e:
-                raise ImportError(f"无法导入HiFiGANDiscriminator：{e}")
+                raise ImportError(f"Failed to import HiFiGANDiscriminator: {e}")
             self.discriminator = HiFiGANDiscriminator(**self.config.get_wave_kwargs())
         
     def _init_optimizer(self):
-        """初始化优化器和调度器"""
+        """Initialize optimizer and scheduler."""
         try:
-            # 尝试多个可能的导入路径
+            # Try several possible import paths
             try:
                 from discriminator.models.duration import NoamScheduler
             except ImportError:
@@ -127,7 +127,7 @@ class DiscriminatorWrapper:
                     sys.path.insert(0, current_dir)
                     from models.duration import NoamScheduler
         except ImportError:
-            raise ImportError("无法导入NoamScheduler类，请确保models.duration模块存在")
+            raise ImportError("Failed to import NoamScheduler. Ensure models.duration exists.")
             
         self.optimizer = torch.optim.Adam(
             self.discriminator.parameters(),
@@ -144,14 +144,14 @@ class DiscriminatorWrapper:
         )
         
     def _init_criterion(self):
-        """初始化损失函数"""
+        """Initialize loss functions."""
         if self.config.input_type == 'music':
-            # Music判别器使用hinge损失
-            self.criterion = None  # 用 hinge 损失函数替代
+            # Music discriminator uses hinge/rank style objective
+            self.criterion = None
         else:
-            # mel/wave 使用 MSE
+            # mel/wave uses MSE
             self.criterion = nn.MSELoss()
-        # 特征匹配使用L1更稳
+        # L1 is more stable for feature matching
         self.fm_criterion = nn.L1Loss()
         
     def _hinge_d_loss(self, d_out):
@@ -225,21 +225,21 @@ class DiscriminatorWrapper:
         return_features: bool = True
     ) -> Dict[str, torch.Tensor]:
         """
-        执行一步discriminator训练
-        
+        Execute one discriminator training step.
+
         Args:
-            fake_data: 生成器生成的假数据 [B, T, Mel]
-            real_data: 真实数据 [B, T, Mel]  
-            lengths: 序列长度 [B]
-            current_step: 当前训练步数
-            return_features: 是否返回特征用于特征匹配损失
-            
+            fake_data: Fake data generated by the generator [B, T, Mel].
+            real_data: Real data [B, T, Mel].
+            lengths: Sequence lengths [B].
+            current_step: Current global training step.
+            return_features: Whether to return features for feature matching.
+
         Returns:
-            包含各种损失的字典
+            Dictionary containing loss terms.
         """
         losses = {}
         
-        # 检查是否到了开始训练discriminator的步数
+        # Check delayed discriminator start
         if current_step < self.config.n_train_start:
             return {
                 'disc_loss': torch.tensor(0.0, device=fake_data.device),
@@ -247,7 +247,7 @@ class DiscriminatorWrapper:
                 'hdn_loss': torch.tensor(0.0, device=fake_data.device) if self.config.enable_hdn_loss else None
             }
             
-        # 检查序列长度是否满足要求（mel判别器需要时间窗口；wave模式忽略长度约束）
+        # Check sequence length constraint (mel only)
         if self._mel_length_too_short(lengths):
             return {
                 'disc_loss': torch.tensor(0.0, device=fake_data.device),
@@ -255,11 +255,11 @@ class DiscriminatorWrapper:
                 'hdn_loss': torch.tensor(0.0, device=fake_data.device) if self.config.enable_hdn_loss else None
             }
         
-        # 1. 训练Discriminator - 区分真假数据
+        # 1. Train discriminator to distinguish real/fake
         # self.optimizer.zero_grad()  # <-- Removed from here
         
         if self.config.input_type == 'music':
-            # MusicDiscriminator: 一次前向调用 (real, fake)，返回结构化输出
+            # MusicDiscriminator: one forward call with (real, fake)
             d_out = self.discriminator(real_data, fake_data.detach())
             
             if self.config.loss_type == 'rank':
@@ -269,31 +269,31 @@ class DiscriminatorWrapper:
                 
             losses['disc_loss'] = disc_loss * self.config.gan_weight
         else:
-            # mel/wave: 分别前向
+            # mel/wave: separate forward passes
             if self.config.input_type == 'mel':
                 d_real, _, _ = self.discriminator(real_data, lengths)
             else:
                 d_real, _, _ = self.discriminator(real_data, None)
             d_real_loss = self.criterion(d_real, torch.ones_like(d_real))
             
-            # 假数据判别（detach以避免影响生成器）
+            # Fake data pass (detach to avoid affecting generator)
             if self.config.input_type == 'mel':
                 d_fake_for_disc, _, _ = self.discriminator(fake_data.detach(), lengths)
             else:
                 d_fake_for_disc, _, _ = self.discriminator(fake_data.detach(), None)
             d_fake_loss = self.criterion(d_fake_for_disc, torch.zeros_like(d_fake_for_disc))
             
-            # Discriminator总损失
+            # Total discriminator loss
             disc_loss = (d_real_loss + d_fake_loss) / self.config.grad_acc_step
             losses['disc_loss'] = disc_loss * self.config.gan_weight
         
-        # 反向传播discriminator
+        # Backward pass for discriminator
         if self.accelerator is not None:
             self.accelerator.backward(disc_loss)
         else:
             disc_loss.backward()
             
-        # 梯度裁剪和优化器步骤
+        # Gradient clipping and optimizer step
         if current_step % self.config.grad_acc_step == 0:
             if self.accelerator is not None:
                 self.accelerator.clip_grad_norm_(self.discriminator.parameters(), self.config.grad_clip_thresh)
@@ -303,8 +303,8 @@ class DiscriminatorWrapper:
             self.scheduler.step()
             self.optimizer.zero_grad()  # Moved here
             
-        # 2. 计算生成器的对抗损失（不反向传播）
-        with torch.set_grad_enabled(True):  # 需要梯度用于生成器训练
+        # 2. Compute generator adversarial loss (no backward here)
+        with torch.set_grad_enabled(True):  # Gradients are needed for generator training
             if self.config.input_type == 'music':
                 # MusicDiscriminator
                 d_out = self.discriminator(real_data, fake_data)
@@ -315,7 +315,7 @@ class DiscriminatorWrapper:
                     gan_loss = self._hinge_g_loss(d_out)
                     
                 losses['gan_loss'] = gan_loss * self.config.gan_weight
-                h_fake = d_out  # 保存用于FM
+                h_fake = d_out  # cache for FM
             else:
                 if self.config.input_type == 'mel':
                     d_fake_for_gen, start_frames_wins, h_fake = self.discriminator(fake_data, lengths)
@@ -324,11 +324,11 @@ class DiscriminatorWrapper:
                 gan_loss = self.criterion(d_fake_for_gen, torch.ones_like(d_fake_for_gen))
                 losses['gan_loss'] = gan_loss * self.config.gan_weight
             
-        # 3. 特征匹配损失
+        # 3. Feature matching loss
         if self.config.enable_hdn_loss and return_features:
             with torch.no_grad():
                 if self.config.input_type == 'music':
-                    # MusicDiscriminator 的 FM 损失
+                    # FM loss for MusicDiscriminator
                     hdn_loss = self._feature_matching_loss(h_fake)
                     losses['hdn_loss'] = hdn_loss * self.config.fml_weight
                 else:
@@ -337,7 +337,7 @@ class DiscriminatorWrapper:
                     else:
                         _, _, h_real = self.discriminator(real_data, None)
                     
-                    # 展平特征层次结构
+                    # Flatten feature hierarchy
                     h_fake_flat = [h_in for h_out in h_fake for h_in in h_out]
                     h_real_flat = [h_in for h_out in h_real for h_in in h_out]
                     
@@ -349,7 +349,7 @@ class DiscriminatorWrapper:
                             )
                             losses['hdn_loss'] = hdn_loss * self.config.fml_weight
                         except RuntimeError:
-                            # 如果stack失败，使用平均特征匹配损失
+                            # Fallback: average pairwise FM loss if stacking fails
                             hdn_loss = sum(
                                 self.fm_criterion(hf, hr) 
                                 for hf, hr in zip(h_fake_flat, h_real_flat)
@@ -371,16 +371,16 @@ class DiscriminatorWrapper:
         current_step: int
     ) -> Dict[str, torch.Tensor]:
         """
-        获取生成器的对抗损失和特征匹配损失（用于生成器训练）
-        
+        Get adversarial and feature-matching losses for generator training.
+
         Args:
-            fake_data: 生成器生成的假数据 [B, T, Mel] 或 [B, T] (wave/music)
-            real_data: 真实数据 [B, T, Mel] 或 [B, T]
-            lengths: 序列长度 [B]（mel模式需要；wave/music模式忽略）
-            current_step: 当前训练步数
-            
+            fake_data: Generated fake data [B, T, Mel] or [B, T] (wave/music).
+            real_data: Real data [B, T, Mel] or [B, T].
+            lengths: Sequence lengths [B] (required for mel, ignored otherwise).
+            current_step: Current global training step.
+
         Returns:
-            包含生成器损失的字典
+            Dictionary containing generator-side losses.
         """
         losses = {}
         
@@ -407,7 +407,7 @@ class DiscriminatorWrapper:
             else:
                 losses['hdn_loss'] = None
         else:
-            # mel/wave: 原有流程
+            # mel/wave: standard flow
             if self.config.input_type == 'mel':
                 d_fake, start_frames_wins, h_fake = self.discriminator(fake_data, lengths)
             else:
@@ -415,7 +415,7 @@ class DiscriminatorWrapper:
             gan_loss = self.criterion(d_fake, torch.ones_like(d_fake))
             losses['gan_loss'] = gan_loss * self.config.gan_weight
             
-            # 特征匹配损失
+            # Feature matching loss
             if self.config.enable_hdn_loss:
                 with torch.no_grad():
                     if self.config.input_type == 'mel':
@@ -449,15 +449,15 @@ class DiscriminatorWrapper:
         
     def save_checkpoint(self, filepath: str):
         """
-        保存discriminator checkpoint
-        
+        Save discriminator checkpoint.
+
         Args:
-            filepath: 保存路径
+            filepath: Destination path.
         """
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         
         if self.accelerator is not None:
-            # 使用accelerate保存
+            # Save using accelerate-unwrapped model
             unwrapped_model = self.accelerator.unwrap_model(self.discriminator)
             checkpoint = {
                 'model': unwrapped_model.state_dict(),
@@ -474,17 +474,17 @@ class DiscriminatorWrapper:
             }
             
         torch.save(checkpoint, filepath)
-        print(f"Discriminator checkpoint已保存到: {filepath}")
+        print(f"Discriminator checkpoint saved to: {filepath}")
         
     def load_checkpoint(self, filepath: str):
         """
-        加载discriminator checkpoint
-        
+        Load discriminator checkpoint.
+
         Args:
-            filepath: checkpoint文件路径
+            filepath: Checkpoint file path.
         """
         if not os.path.exists(filepath):
-            raise FileNotFoundError(f"Checkpoint文件不存在: {filepath}")
+            raise FileNotFoundError(f"Checkpoint file not found: {filepath}")
             
         if self.accelerator is not None:
             map_location = self.accelerator.device
@@ -493,45 +493,45 @@ class DiscriminatorWrapper:
             
         checkpoint = torch.load(filepath, map_location=map_location)
         
-        # 加载模型状态
+        # Load model state
         if self.accelerator is not None:
             unwrapped_model = self.accelerator.unwrap_model(self.discriminator)
             unwrapped_model.load_state_dict(checkpoint['model'])
         else:
             self.discriminator.load_state_dict(checkpoint['model'])
             
-        # 加载优化器和调度器状态
+        # Load optimizer and scheduler states
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.scheduler.load_state_dict(checkpoint['scheduler'])
         
-        print(f"Discriminator checkpoint已加载: {filepath}")
+        print(f"Discriminator checkpoint loaded: {filepath}")
         
     def load_checkpoint_from_dict(self, checkpoint_dict: dict):
         """
-        从字典加载discriminator checkpoint
-        
+        Load discriminator checkpoint from a dictionary.
+
         Args:
-            checkpoint_dict: checkpoint字典
+            checkpoint_dict: Checkpoint dictionary.
         """
-        # 加载模型状态
+        # Load model state
         if self.accelerator is not None:
             unwrapped_model = self.accelerator.unwrap_model(self.discriminator)
             unwrapped_model.load_state_dict(checkpoint_dict['model'])
         else:
             self.discriminator.load_state_dict(checkpoint_dict['model'])
             
-        # 加载优化器和调度器状态
+        # Load optimizer and scheduler states
         self.optimizer.load_state_dict(checkpoint_dict['optimizer'])
         self.scheduler.load_state_dict(checkpoint_dict['scheduler'])
         
-        print("Discriminator checkpoint已从字典加载")
+        print("Discriminator checkpoint loaded from dictionary")
         
     def get_learning_rate(self) -> float:
-        """获取当前学习率"""
+        """Get current learning rate."""
         return self.optimizer.param_groups[0]['lr']
         
     def state_dict(self) -> dict:
-        """获取完整状态字典"""
+        """Get full state dictionary."""
         if self.accelerator is not None:
             unwrapped_model = self.accelerator.unwrap_model(self.discriminator)
             model_state = unwrapped_model.state_dict()
@@ -546,11 +546,11 @@ class DiscriminatorWrapper:
         }
         
     def eval(self):
-        """切换到评估模式"""
+        """Switch to evaluation mode."""
         self.discriminator.eval()
         
     def train(self): 
-        """切换到训练模式"""
+        """Switch to training mode."""
         self.discriminator.train()
 
 
