@@ -18,92 +18,21 @@ Discriminator包装类 - 支持Accelerate并行训练
     d_wrapper.save_checkpoint("path/to/checkpoint.pth")
 """
 
+import os
+import sys
+from typing import Dict, Optional, Union
 import torch
 import torch.nn as nn
-import os
-from typing import Dict, Optional, Union
-from dataclasses import dataclass
-import sys
 
-
-
-@dataclass
-class DiscriminatorConfig:
-    """Discriminator配置类"""
-    # 模型参数
-    time_lengths: list = None  # 时间窗口长度，如[64,64,64]
-    freq_lengths: list = None  # 频带长度，如[40,40,40] 
-    kernel_size: int = 3
-    hidden_size: int = 128
-    n_mel_channels: int = 128  # mel频谱通道数
-    # 输入类型：
-    # 'mel' 使用本项目的频带多窗口判别器
-    # 'wave' 使用HiFi-GAN风格MSD+MPD（简洁版）
-    # 'music' 使用增强型MusicDiscriminator（MSD+MPD+可选SpecD，支持hinge损失）
-    input_type: str = 'mel'
-    # HiFi-GAN/Music 参数（当 input_type 为 'wave' 或 'music' 时有效）
-    mpd_periods: list = None  # 例如 [2,3,5,7,11,13]
-    msd_pool_scales: list = None  # 例如 [1,2,4,8]（代替 ms_poolings）
-    ms_poolings: list = None  # 兼容字段，若设置则覆盖 msd_pool_scales
-    # Music判别器专用
-    enable_music_spec: bool = False  # 是否启用多分辨率频谱判别分支
-    mr_stft_cfg: list = None  # 多分辨率STFT配置，例如 [dict(n_fft=1024, hop=256, win=1024), ...]
-    # 损失函数类型：'mse'（LSGAN，默认）或 'hinge'（仅 input_type='music' 时）或 'rank'（偏好对loss）
-    loss_type: str = 'rank'
-    rank_margin: float = 0.0  # Rank loss的边距参数，仅当 loss_type='rank' 时有效
-    
-    # 训练参数
-    n_train_start: int = 0  # 延迟启动步数
-    # 新：分别控制对抗损失与特征匹配损失的权重
-    gan_weight: float = 0.5  # 对抗损失权重（原 gan_loss_lambda）
-    fml_weight: float = 1.0 # 特征匹配损失权重（Feature Matching Loss）
-    # 兼容：若仍传入 gan_loss_lambda，将同时覆盖 gan_weight 与 fml_weight
-    gan_loss_lambda: Optional[float] = None  # 兼容字段，不再直接使用
-    enable_hdn_loss: bool = True  # 是否启用特征匹配损失
-    
-    # 优化器参数
-    lr: float = 0.0001
-    betas: list = None  # [0.9, 0.98]
-    eps: float = 1e-9
-    weight_decay: float = 0.0
-    
-    # 调度器参数  
-    n_warmup: int = 2000
-    init_scale: float = 0.25
-    grad_clip_thresh: float = 1.0
-    grad_acc_step: int = 1
-    
-    def __post_init__(self):
-        if self.time_lengths is None:
-            self.time_lengths = [64, 64, 64]
-        if self.freq_lengths is None:
-            self.freq_lengths = [64, 64, 64]
-        if self.betas is None:
-            self.betas = [0.9, 0.98]
-        if self.mpd_periods is None:
-            self.mpd_periods = [2, 3, 5, 7, 11, 13] if self.input_type == 'music' else [2, 3, 5, 7, 11]
-            # self.mpd_periods = [2, 3, 5, 7, 11] if self.input_type == 'music' else [2, 3, 5, 7, 11]
-        # msd_pool_scales 和 ms_poolings 兼容处理
-        if self.ms_poolings is not None and self.msd_pool_scales is None:
-            self.msd_pool_scales = self.ms_poolings
-        if self.msd_pool_scales is None:
-            self.msd_pool_scales = [1, 2, 4, 8] if self.input_type == 'music' else [1, 2, 4]
-            # self.msd_pool_scales = [1, 2, 4] if self.input_type == 'music' else [1, 2, 4]
-        # Music判别器的多分辨率STFT配置
-        if self.mr_stft_cfg is None:
-            self.mr_stft_cfg = [
-                dict(n_fft=1024, hop=256, win=1024),
-                dict(n_fft=2048, hop=512, win=2048),
-                dict(n_fft=4096, hop=1024, win=4096),
-            ]
-        # 兼容旧参数：如果提供了 gan_loss_lambda，则同时设置 gan_weight 和 fml_weight
-        if self.gan_loss_lambda is not None:
-            try:
-                val = float(self.gan_loss_lambda)
-            except Exception:
-                val = 0.1
-            self.gan_weight = val
-            self.fml_weight = val
+try:
+    from discriminator.models.config import DiscriminatorConfig
+except ImportError:
+    try:
+        from .models.config import DiscriminatorConfig
+    except ImportError:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, current_dir)
+        from models.config import DiscriminatorConfig
 
 
 class DiscriminatorWrapper:
@@ -129,10 +58,7 @@ class DiscriminatorWrapper:
             device: 设备，如果提供accelerator则忽略此参数
         """
         # 配置处理
-        if isinstance(config, dict):
-            self.config = DiscriminatorConfig(**config)
-        else:
-            self.config = config
+        self.config = DiscriminatorConfig.from_dict(config) if isinstance(config, dict) else config
             
         self.accelerator = accelerator
         self.device = device if accelerator is None else None
@@ -160,14 +86,12 @@ class DiscriminatorWrapper:
                     try:
                         from .models.discriminator import Discriminator
                     except ImportError:
-                        import sys
-                        import os
                         current_dir = os.path.dirname(os.path.abspath(__file__))
                         sys.path.insert(0, current_dir)
                         from models.discriminator import Discriminator
             except ImportError:
                 raise ImportError("无法导入Discriminator类，请确保models.discriminator模块存在")
-            self.discriminator = Discriminator(self.config)
+            self.discriminator = Discriminator(self.config.get_mel_hparams())
         elif self.config.input_type == 'music':
             # 使用增强型MusicDiscriminator（MSD+MPD+可选SpecD，hinge损失）
             try:
@@ -177,13 +101,7 @@ class DiscriminatorWrapper:
                     from models.music_discriminator import MusicDiscriminator
             except Exception as e:
                 raise ImportError(f"无法导入MusicDiscriminator：{e}")
-            self.discriminator = MusicDiscriminator(
-                sample_rate=44100,
-                mpd_periods=tuple(self.config.mpd_periods),
-                msd_pool_scales=tuple(self.config.msd_pool_scales),
-                enable_spec=self.config.enable_music_spec,
-                mr_stft_cfg=self.config.mr_stft_cfg,
-            )
+            self.discriminator = MusicDiscriminator(**self.config.get_music_kwargs())
         else:
             # 使用HiFi-GAN风格的多尺度多周期判别器（波形域）
             try:
@@ -193,10 +111,7 @@ class DiscriminatorWrapper:
                     from models.hifigan import HiFiGANDiscriminator
             except Exception as e:
                 raise ImportError(f"无法导入HiFiGANDiscriminator：{e}")
-            self.discriminator = HiFiGANDiscriminator(
-                periods=tuple(self.config.mpd_periods),
-                poolings=tuple(self.config.msd_pool_scales),
-            )
+            self.discriminator = HiFiGANDiscriminator(**self.config.get_wave_kwargs())
         
     def _init_optimizer(self):
         """初始化优化器和调度器"""
@@ -208,9 +123,6 @@ class DiscriminatorWrapper:
                 try:
                     from models.duration import NoamScheduler
                 except ImportError:
-                    import sys
-                    import os
-                    # 添加cc-word-encoder目录到路径
                     current_dir = os.path.dirname(os.path.abspath(__file__))
                     sys.path.insert(0, current_dir)
                     from models.duration import NoamScheduler
@@ -298,6 +210,11 @@ class DiscriminatorWrapper:
                 loss += self.fm_criterion(ff, rf.detach())
                 count += 1
         return loss / max(count, 1)
+
+    def _mel_length_too_short(self, lengths: torch.Tensor) -> bool:
+        if self.config.input_type != 'mel':
+            return False
+        return lengths.min() < self.config.min_mel_frames()
         
     def train_step(
         self, 
@@ -331,7 +248,7 @@ class DiscriminatorWrapper:
             }
             
         # 检查序列长度是否满足要求（mel判别器需要时间窗口；wave模式忽略长度约束）
-        if self.config.input_type == 'mel' and lengths.min() < max(self.config.time_lengths):
+        if self._mel_length_too_short(lengths):
             return {
                 'disc_loss': torch.tensor(0.0, device=fake_data.device),
                 'gan_loss': torch.tensor(0.0, device=fake_data.device), 
@@ -467,7 +384,7 @@ class DiscriminatorWrapper:
         """
         losses = {}
         
-        if current_step < self.config.n_train_start or (self.config.input_type == 'mel' and lengths.min() < max(self.config.time_lengths)):
+        if current_step < self.config.n_train_start or self._mel_length_too_short(lengths):
             return {
                 'gan_loss': torch.tensor(0.0, device=fake_data.device),
                 'hdn_loss': torch.tensor(0.0, device=fake_data.device) if self.config.enable_hdn_loss else None
