@@ -21,7 +21,7 @@ set -e
 #     --model_type bdc_sg_bs_roformer \
 #     --config_path ckpt/bdc_sg_bs_roformer/config.yaml \
 #     --start_check_point  results/results_bdc_sg_bs_roformer/model_bdc_sg_bs_roformer_ep_41_sisdr_9.5502.ckpt \
-#     --input_folder /user-fs/chenzihao/chengongyu/svc/seed-vc/test/moban/11月/破音/raw  \
+#     --input_folder /user-fs/chenzihao/chengongyu/svc/seed-vc/test/moban/november/distortion/raw  \
 #     --store_dir test_sample/11poyin-bdc-sg-bs \
 #     --extract_other
 
@@ -79,7 +79,7 @@ PYTHONWARNINGS="ignore" python inference_with_spk.py \
 # dataset/lead_back_vocals
 # test_sample/raw
 # /user-fs/chenzihao/chengongyu/svc/seed-vc/test/xianshang/11.25raw
-# /user-fs/chenzihao/chengongyu/svc/seed-vc/test/moban/11月/破音/raw
+# /user-fs/chenzihao/chengongyu/svc/seed-vc/test/moban/november/distortion/raw
 # /user-fs/chenzihao/chengongyu/svc/seed-vc/test/xianshang/moban1223
 
 STATUS=$?

@@ -1,18 +1,18 @@
 #!/bin/bash
 # train_accelerate.sh
-trap 'echo "Ctrl+C 清理进程中..."; pkill -f train_accelerate_fixed.py; exit 0' INT
+trap 'echo "Ctrl+C cleaning up processes..."; pkill -f train_accelerate_fixed.py; exit 0' INT
 
-# 如果需要在线同步，请填写 WANDB_KEY 并移除/注释 WANDB_MODE 设置
+# If online sync is needed, fill WANDB_KEY and remove/comment WANDB_MODE
 # export WANDB_MODE="offline"
 WANDB_KEY=""
 
 export NCCL_DEBUG=INFO
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_IB_DISABLE=1          # 若没有 InfiniBand
-export NCCL_P2P_DISABLE=1        # 默认即可；若有报错可暂时设1
-export NCCL_SOCKET_IFNAME=eth0    # 换成实际网卡，如 ens3
+export NCCL_IB_DISABLE=1          # Set when InfiniBand is unavailable
+export NCCL_P2P_DISABLE=1        # Usually fine by default; set to 1 temporarily if errors occur
+export NCCL_SOCKET_IFNAME=eth0    # Replace with your actual NIC, e.g. ens3
 export GLOO_SOCKET_IFNAME=eth0
-export MASTER_PORT=$((10000 + RANDOM % 50000))  # 随机一个空闲端口
+export MASTER_PORT=$((10000 + RANDOM % 50000))  # Randomly choose an available port
 
 
 # accelerate config

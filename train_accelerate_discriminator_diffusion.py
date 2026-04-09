@@ -4,7 +4,7 @@ __version__ = '1.0.4'
 
 # Read more here:
 # https://huggingface.co/docs/accelerate/index
-# 改进: 修复多卡训练问题
+# Improvements: fixes for multi-GPU training issues
 
 import argparse
 import soundfile as sf
@@ -43,7 +43,7 @@ metric_list = ["sdr", "si_sdr", "l1_freq", "bleedless", "fullness"]
 def valid(model, valid_loader, args, config, device, verbose=False, diffusion_wrapper=None, current_step=None):
     instruments = prefer_target_instrument(config)
 
-    # 改为字典的字典结构: {metric: {instr: []}}
+    # Use nested dictionary structure: {metric: {instr: []}}
     all_metrics = {}
     for metric in metric_list:
         all_metrics[metric] = {}
@@ -59,7 +59,7 @@ def valid(model, valid_loader, args, config, device, verbose=False, diffusion_wr
         path = path_list[0]
         mix, sr = sf.read(path)
         folder = os.path.dirname(path)
-        res = demix(config, model, mix.T, device, model_type=args.model_type)  # 返回 dict: {instr: [C, T]}
+        res = demix(config, model, mix.T, device, model_type=args.model_type)  # returns dict: {instr: [C, T]}
 
         for stem_idx, instr in enumerate(instruments):
             if instr != 'other' or config.training.other_fix is False:
@@ -69,31 +69,31 @@ def valid(model, valid_loader, args, config, device, verbose=False, diffusion_wr
                 track, sr1 = sf.read(folder + '/{}.wav'.format('vocals'))
                 track = mix - track
             
-            # 如果使用扩散模型进行后处理/增强
+            # Apply diffusion model post-processing/enhancement when enabled
             if diffusion_wrapper is not None and (diffusion_wrapper[stem_idx] is not None and current_step >= diffusion_wrapper[stem_idx].config.n_train_start):
                 diff_model = diffusion_wrapper[stem_idx]
                 if diff_model is not None:
                     # res[instr]: [C, T] numpy array
-                    # 转换为 torch tensor: [C, T] -> [1, C, T]
+                    # Convert to torch tensor: [C, T] -> [1, C, T]
                     source_wave = torch.from_numpy(res[instr]).unsqueeze(0).to(device)
                     
-                    # 使用扩散模型推理
+                    # Run diffusion inference
                     with torch.no_grad():
                         enhanced_wave = diff_model.inference(
                             source_wave,  # [1, C, T]
-                            num_steps=10,  # 固定为10步
+                            num_steps=10,  # fixed to 10 steps
                             method='euler'
                         )
                     
-                    # 转换回numpy: [1, C, T] -> [C, T]
+                    # Convert back to numpy: [1, C, T] -> [C, T]
                     res[instr] = enhanced_wave.squeeze(0).cpu().numpy()
             
-            # 用于计算指标: res[instr].T 将 [C, T] 转为 [T, C]
+            # Metric computation expects [T, C], convert from [C, T]
             references = np.expand_dims(track, axis=0)  # [T, C] -> [1, T, C]
             estimates = np.expand_dims(res[instr].T, axis=0)  # [C, T] -> [T, C] -> [1, T, C]
 
             results = get_metrics(metric_list, references, estimates, mix)
-            # results 是一个列表: [(metric_name, value), ...]
+            # results is a list: [(metric_name, value), ...]
             for metric_name, value in results:
                 single_val = torch.tensor([value], device=device, dtype=torch.float32)
                 all_metrics[metric_name][instr].append(single_val)
@@ -171,7 +171,7 @@ def train_model(args):
     # torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False # Fix possible slow down with dilation convolutions
     
-    # 修复1: 添加异常处理，避免多次设置spawn导致错误
+    # Fix 1: add exception handling to avoid repeated spawn setup failures
     try:
         torch.multiprocessing.set_start_method('spawn', force=True)
     except RuntimeError as e:
@@ -180,7 +180,7 @@ def train_model(args):
     model, config = get_model_from_config(args.model_type, args.config_path)
     accelerator.print("Instruments: {}".format(config.training.instruments))
     
-    # 修复2: 添加调试信息，显示分布式训练信息
+    # Fix 2: add debug logs for distributed training state
     accelerator.print(f"[DEBUG] Number of processes: {accelerator.num_processes}")
     accelerator.print(f"[DEBUG] Device: {accelerator.device}")
     accelerator.print(f"[DEBUG] Is main process: {accelerator.is_main_process}")
@@ -229,13 +229,13 @@ def train_model(args):
         shuffle=False,
     )
 
-    # 修复3: 检查点加载应该在prepare之前
+    # Fix 3: checkpoint loading should happen before prepare
     if args.start_check_point != '':
         accelerator.print('Start from checkpoint: {}'.format(args.start_check_point))
         if 0:
             load_not_compatible_weights(model, args.start_check_point, verbose=False)
         else:
-            # 在prepare前加载，确保权重正确应用
+            # Load before prepare to ensure weights are correctly applied
             checkpoint = torch.load(args.start_check_point, map_location='cpu')
             model.load_state_dict(checkpoint, strict=False)
             if args.copy_first_mask_estimator:
@@ -247,16 +247,16 @@ def train_model(args):
                     model.unfreeze_mask_estimators_by_indexes(args.estimator_unfreeze_indexes)
             accelerator.print(f"Checkpoint loaded successfully")
             
-    # Discriminator setup - 从配置文件读取
+    # Discriminator setup - read from config
     discriminators = []
     gan_models = []
     if args.use_discriminator:
-        # 从配置文件读取 gan_model 列表
+        # Read gan_model list from config
         gan_models_raw = getattr(config.training, 'gan_model', None)
         num_stems = len(config.training.instruments)
         
         if gan_models_raw is None:
-            # 默认使用 mel 判别器
+            # Default to mel discriminator
             accelerator.print("Warning: gan_model not found in config, using default 'mel' for all stems")
             gan_models = ['mel'] * num_stems
         elif len(gan_models_raw) != num_stems:
@@ -268,19 +268,19 @@ def train_model(args):
         
         for idx, (instr, input_type) in enumerate(zip(config.training.instruments, gan_models)):
             if input_type is None or input_type.lower() == 'none':
-                # 不使用判别器
+                # No discriminator for this stem
                 accelerator.print(f"Stem '{instr}': No discriminator (None)")
                 discriminators.append(None)
                 continue
             
-            # 根据 input_type 创建配置
+            # Build config based on input_type
             disc_cfg = DiscriminatorConfig(
                 input_type=input_type,
             )
             
             disc_wrapper = DiscriminatorWrapper(disc_cfg, accelerator)
             
-            # 加载检查点（如果提供）
+            # Load checkpoint if provided
             if args.discriminator_start_check_point != '':
                 ckpt_path = os.path.join(args.discriminator_start_check_point, f'{instr}.pth')
                 if os.path.exists(ckpt_path):
@@ -296,7 +296,7 @@ def train_model(args):
         # Prepare all discriminators (skip None)
         discriminators = [accelerator.prepare(d) if d is not None else None for d in discriminators]
 
-    # MelSpectrogram for discriminator (仅当使用 mel 类型时需要)
+    # MelSpectrogram for discriminator (only needed for mel input type)
     mel = None
     to_db = None
     if args.use_discriminator and any(m == 'mel' for m in gan_models if m is not None):
@@ -316,7 +316,7 @@ def train_model(args):
         to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=130).to(accelerator.device)
 
     def wave_BC_to_mel(w):  # w: [B, C, T]
-        # 梅尔：输出 [B, C, n_mels, F]
+        # Mel output: [B, C, n_mels, F]
         m = mel(w) + 1e-5
         m = to_db(m)                     # [B, C, n_mels, F]
         m = m.permute(0, 1, 3, 2)        # [B, C, F, n_mels]
@@ -328,7 +328,7 @@ def train_model(args):
         return Lf.repeat_interleave(C)
     
     def wave_BC_to_wave_B(w):  # w: [B, C, T]
-        # 将双声道音频转换为单个batch维度: [B*C, T]
+        # Convert stereo audio to flattened batch dimension: [B*C, T]
         B, C, T = w.shape
         return w.reshape(B * C, T)
     # End of MelSpectrogram for discriminator
@@ -360,7 +360,7 @@ def train_model(args):
             
             diff_wrapper = DiffusionWrapper(diff_cfg, accelerator)
             
-            # 加载检查点（如果提供）
+            # Load checkpoint if provided
             if args.diffusion_model_path != '':
                 ckpt_path = os.path.join(args.diffusion_model_path, f'{instr}_diffusion.pth')
                 if os.path.exists(ckpt_path):
@@ -431,8 +431,8 @@ def train_model(args):
             **loss_options
         )
 
-    # 修复4: 重新排列prepare顺序 - 先prepare model和optimizer
-    # 这样可以确保model被正确地复制到各个GPU上
+    # Fix 4: reorder prepare sequence - prepare model and optimizer first
+    # This ensures model replicas are correctly placed on all GPUs
     model, optimizer = accelerator.prepare(model, optimizer)
     train_loader, scheduler = accelerator.prepare(train_loader, scheduler)
     valid_loader = accelerator.prepare(valid_loader)
@@ -459,7 +459,7 @@ def train_model(args):
 
         instruments = prefer_target_instrument(config)
         
-        # 打印所有指标
+        # Print all metrics
         for metric_name in metric_list:
             metric_avg = 0.0
             for instr in instruments:
@@ -477,7 +477,7 @@ def train_model(args):
 
     accelerator.print('Train for: {}'.format(config.training.num_epochs))
     best_sdr = 0
-    best_si_sdr = -float('inf')  # 添加SI-SDR追踪
+    best_si_sdr = -float('inf')  # Track SI-SDR
     current_step = 0
     for epoch in range(config.training.num_epochs):
         model.train()
@@ -518,7 +518,7 @@ def train_model(args):
                         coarse=config.training.coarse_loss_clip
                     )
                     
-            # Discriminator training step - 支持多个判别器
+            # Discriminator training step - supports multiple discriminators
             if args.use_discriminator:
                 B, I, C, T = y_.shape
                 num_stems = len(config.training.instruments)
@@ -529,37 +529,37 @@ def train_model(args):
                 disc_losses_dict = {}
                 gen_losses_dict = {}
                 
-                # 帧长度（仅mel类型需要）
+                # Frame length (only required for mel type)
                 len_samples = torch.full((B,), T, device=y_.device, dtype=torch.long)
                 len_frames = samp_to_frames(len_samples, C) if mel is not None else None
                 
                 for stem_idx, (disc, input_type, instr) in enumerate(zip(discriminators, gan_models, config.training.instruments)):
-                    # 跳过没有判别器的stem
+                    # Skip stems without a discriminator
                     if disc is None or input_type is None or input_type.lower() == 'none':
                         continue
                     
-                    # 提取当前stem的真假数据: [B, C, T]
+                    # Extract real/fake tensors for current stem: [B, C, T]
                     fake_stem = y_[:, stem_idx, :, :]
                     real_stem = y[:, stem_idx, :, :]
                     
-                    # 根据 input_type 准备输入
+                    # Prepare discriminator inputs based on input_type
                     if input_type == 'mel':
                         fake_input = wave_BC_to_mel(fake_stem)
                         real_input = wave_BC_to_mel(real_stem)
                         length_input = len_frames
                     elif input_type in ['wave', 'music']:
-                        # wave/music 判别器接收 [B*C, T] 格式
+                        # wave/music discriminator expects [B*C, T]
                         fake_input = wave_BC_to_wave_B(fake_stem)
                         real_input = wave_BC_to_wave_B(real_stem)
-                        length_input = None  # wave判别器不需要长度信息
+                        length_input = None  # wave discriminator does not require lengths
                     else:
                         raise ValueError(f"Unknown input_type: {input_type}")
                     
-                    # 1) 更新判别器
+                    # 1) Update discriminator
                     d_losses = disc.train_step(fake_input, real_input, length_input, current_step=current_step)
                     disc_losses_dict[f'disc_{instr}'] = d_losses.get('disc_loss', 0.0)
                     
-                    # 2) 冻结判别器，计算生成器损失
+                    # 2) Freeze discriminator, compute generator losses
                     for p in disc.discriminator.parameters():
                         p.requires_grad = False
                     
@@ -574,11 +574,11 @@ def train_model(args):
                     gen_losses_dict[f'gen_{instr}_gan'] = gan_loss.item() if isinstance(gan_loss, torch.Tensor) else gan_loss
                     gen_losses_dict[f'gen_{instr}_fm'] = fm_loss.item() if isinstance(fm_loss, torch.Tensor) else fm_loss
                     
-                    # 3) 解冻判别器
+                    # 3) Unfreeze discriminator
                     for p in disc.discriminator.parameters():
                         p.requires_grad = True
                 
-                    # 累加到总损失
+                    # Accumulate into total loss
                     loss = loss + total_gan_loss + total_fm_loss
 
             if args.use_diffusion:
@@ -591,7 +591,7 @@ def train_model(args):
                     if diff_model is None:
                         continue
                     
-                    # 提取当前stem的预测数据: [B, C, T]
+                    # Extract predicted tensors for current stem: [B, C, T]
                     pred_stem = y_[:, stem_idx, :, :]
                     target_stem = y[:, stem_idx, :, :]
                     
@@ -611,26 +611,26 @@ def train_model(args):
             if accelerator.is_main_process:
                 log_dict = {'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1), 'total': total, 'loss_val': loss_val, 'i': i}
                 
-                # 添加所有判别器损失到日志
+                # Add discriminator losses to logging
                 if args.use_discriminator:
                     log_dict.update(disc_losses_dict)
                     log_dict.update(gen_losses_dict)
                     log_dict['total_gan_loss'] = total_gan_loss.item() if isinstance(total_gan_loss, torch.Tensor) else total_gan_loss
                     log_dict['total_fm_loss'] = total_fm_loss.item() if isinstance(total_fm_loss, torch.Tensor) else total_fm_loss
                 
-                # 添加所有扩散模型损失到日志
+                # Add diffusion losses to logging
                 if args.use_diffusion:
                     log_dict.update(diffusion_losses_dict)
                 
                 wandb.log(log_dict)
                 pbar.set_postfix({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1)})
                 
-            # 仅保存最后的判别器检查点0
+            # Save latest discriminator/diffusion checkpoints periodically
             if (args.use_discriminator or args.use_diffusion) and (current_step + 1) % getattr(config.training, 'save_interval', 1000) == 0 and accelerator.is_main_process:
                 ckpt_dir = os.path.join(args.results_path, "last_additional_model_ckpt")
                 os.makedirs(ckpt_dir, exist_ok=True)
                 for disc, instr in zip(discriminators, config.training.instruments):
-                    if disc is not None:  # 只保存非None的判别器
+                    if disc is not None:  # save only non-None discriminators
                         disc.save_checkpoint(os.path.join(ckpt_dir, f'{instr}.pth'))
                 accelerator.print(f"Discriminator checkpoints saved to {ckpt_dir}")
                 
@@ -663,7 +663,7 @@ def train_model(args):
         
         accelerator.wait_for_everyone()
 
-        # 计算所有指标的平均值
+        # Compute averages for all metrics
         sdr_avg = 0.0
         si_sdr_avg = 0.0
         instruments = prefer_target_instrument(config)
@@ -686,7 +686,7 @@ def train_model(args):
             
             metric_avg /= len(instruments)
             
-            # 保存SDR和SI-SDR的平均值
+            # Save SDR and SI-SDR averages
             if metric_name == 'sdr':
                 sdr_avg = metric_avg
             elif metric_name == 'si_sdr':
@@ -697,14 +697,14 @@ def train_model(args):
                 if len(instruments) > 1:
                     print('{} Avg: {:.4f}'.format(metric_name.upper(), metric_avg))
         
-        # 记录所有指标到wandb
+        # Log all metrics to wandb
         if accelerator.is_main_process:
             metrics_to_log['best_sdr'] = best_sdr
             metrics_to_log['best_si_sdr'] = best_si_sdr
             metrics_to_log['epoch'] = epoch
             wandb.log(metrics_to_log)
 
-        # 使用SI-SDR保存最佳检查点
+        # Save best checkpoint using SI-SDR
         if accelerator.is_main_process:
             if si_sdr_avg > best_si_sdr:
                 store_path = args.results_path + '/model_{}_ep_{}_sisdr_{:.4f}.ckpt'.format(args.model_type, epoch, si_sdr_avg)
@@ -713,11 +713,11 @@ def train_model(args):
                 accelerator.save(unwrapped_model.state_dict(), store_path)
                 best_si_sdr = si_sdr_avg
             
-            # 同时记录SDR最佳（可选）
+            # Also keep best SDR (optional)
             if sdr_avg > best_sdr:
                 best_sdr = sdr_avg
 
-            # 使用SI-SDR作为调度器的指标
+            # Use SI-SDR as scheduler metric
             scheduler.step(si_sdr_avg)
 
         metrics_dict = None
